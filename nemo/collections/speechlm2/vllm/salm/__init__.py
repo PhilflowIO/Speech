@@ -253,9 +253,13 @@ def register():
 
     _patch_vllm_for_nemo_speechlm_mtp()
 
-    from nemo.collections.speechlm2.vllm.salm.runtime_compat import install_prompt_contract
+    from nemo.collections.speechlm2.vllm.salm.runtime_compat import (
+        install_marlin_gateless_moe_padding,
+        install_prompt_contract,
+    )
 
     install_prompt_contract()
+    install_marlin_gateless_moe_padding()
 
     # DFlash aliases are optional compatibility shims. Install them only after
     # the mandatory SpeechLM model, MTP hook, and prompt contract are active so

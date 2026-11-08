@@ -12,21 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-scoped vLLM adapter for SpeechLM's training-time prompt contract.
+"""Model-scoped vLLM adapters for serving SpeechLM.
 
-Audio remains registered through vLLM's multimodal parser while the rendered
-user content matches ``SALMDataset``: text is followed by one ASCII space and
-one ordered ``<|audio|>`` locator per audio payload, with adjacent locators
-separated by one ASCII space.
+Prompt contract: audio remains registered through vLLM's multimodal parser while
+the rendered user content matches ``SALMDataset``: text is followed by one ASCII
+space and one ordered ``<|audio|>`` locator per audio payload, with adjacent
+locators separated by one ASCII space.
+
+Marlin padding: vLLM's padding of misaligned MoE intermediates assumes gated
+experts; see ``install_marlin_gateless_moe_padding``.
 """
 
 from __future__ import annotations
 
+import importlib
+import logging
 from collections.abc import Iterable
 from functools import wraps
 from typing import Any
 
 from nemo.collections.speechlm2.vllm.salm.config import SPEECHLM_MTP_MODEL_TYPE, TRANSCRIBE_MTP_MODEL_TYPE
+
+_LOGGER = logging.getLogger(__name__)
+_INT_WNA16_MODULE = "vllm.model_executor.layers.fused_moe.oracle.int_wna16"
 
 _AUDIO_LOCATOR = "<|audio|>"
 _AUDIO_PART_TYPES = frozenset({"audio_url", "input_audio", "audio_embeds"})
@@ -216,3 +224,63 @@ def _locate_chat_parser() -> tuple[Any, str]:
 def install_prompt_contract() -> None:
     """Install the SpeechLM-only vLLM chat rendering adapter."""
     _patch_speechlm_training_prompt_contract(*_locate_chat_parser())
+
+
+def _w13_shard_count(columns: int, unit: int) -> int:
+    """Return how many ``unit``-wide w13 shards a tensor with ``columns`` columns holds.
+
+    Gated experts store gate and up side by side (2 shards), gate-less experts
+    only up (1 shard). Nothing else is legal, so a shape that fits neither is an
+    error rather than something to pad.
+    """
+    if unit > 0 and columns in (unit, 2 * unit):
+        return columns // unit
+    raise ValueError(
+        f"Cannot pad MoE w13 weights: {columns} columns is neither one nor two shards of {unit} columns."
+    )
+
+
+def _pad_w13_shard_cols(x: Any, unit: int, padded_unit: int) -> Any:
+    """Zero-pad each w13 shard of an ``(E, rows, shards * unit)`` tensor to ``padded_unit`` columns."""
+    if padded_unit == unit:
+        return x
+    from torch.nn.functional import pad
+
+    experts, rows, columns = x.shape
+    shards = _w13_shard_count(columns, unit)
+    padded = pad(x.view(experts, rows, shards, unit), (0, padded_unit - unit))
+    return padded.reshape(experts, rows, shards * padded_unit).contiguous()
+
+
+def _pad_w13_bias(bias: Any, n: int, padded_n: int) -> Any:
+    """Zero-pad each w13 shard of an ``(E, shards * n)`` bias to ``padded_n``."""
+    if padded_n == n:
+        return bias
+    from torch.nn.functional import pad
+
+    experts, columns = bias.shape
+    shards = _w13_shard_count(columns, n)
+    padded = pad(bias.view(experts, shards, n), (0, padded_n - n))
+    return padded.reshape(experts, shards * padded_n).contiguous()
+
+
+def install_marlin_gateless_moe_padding() -> None:
+    """Make vLLM's Marlin MoE padding handle gate-less experts.
+
+    vLLM 0.33 zero-pads a misaligned intermediate size to a Marlin thread tile, but
+    its helpers reshape w13 as two shards. NemotronH's experts are gate-less, so
+    their w13 has one shard and the reshape raises at weight loading. The
+    replacements read the shard count off the tensor, which leaves gated experts
+    untouched. If a vLLM release restructures these helpers there is nothing to
+    correct here; a remaining mismatch would still fail loudly at weight loading.
+    """
+    try:
+        int_wna16 = importlib.import_module(_INT_WNA16_MODULE)
+    except ImportError:
+        _LOGGER.warning("%s is not importable; not patching Marlin MoE padding.", _INT_WNA16_MODULE)
+        return
+    for name, replacement in (("_pad_w13_shard_cols", _pad_w13_shard_cols), ("_pad_w13_bias", _pad_w13_bias)):
+        if callable(getattr(int_wna16, name, None)):
+            setattr(int_wna16, name, replacement)
+        else:
+            _LOGGER.warning("vLLM has no %s.%s; not patching it.", _INT_WNA16_MODULE, name)

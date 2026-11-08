@@ -18,9 +18,13 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from nemo.collections.speechlm2.vllm.salm.runtime_compat import (
+    _pad_w13_bias,
+    _pad_w13_shard_cols,
     _patch_speechlm_training_prompt_contract,
+    install_marlin_gateless_moe_padding,
     install_prompt_contract,
 )
 
@@ -293,3 +297,82 @@ def test_install_prompt_contract_is_idempotent_on_vllm_0_33(monkeypatch):
 def test_adapter_names_the_missing_public_parser():
     with pytest.raises(TypeError, match="parse_chat_message_content_parts is missing"):
         _patch_speechlm_training_prompt_contract(SimpleNamespace(), "parse_chat_message_content_parts")
+
+
+class TestMarlinGatelessMoePadding:
+    """Padding of vLLM's MoE w13 weights handles gate-less (1 shard) and gated (2 shards) experts."""
+
+    INT_WNA16 = "vllm.model_executor.layers.fused_moe.oracle.int_wna16"
+
+    def test_gateless_weight_pads_single_shard_columns(self):
+        x = torch.arange(1, 1 + 2 * 3 * 928, dtype=torch.float32).reshape(2, 3, 928)
+
+        padded = _pad_w13_shard_cols(x, 928, 960)
+
+        assert padded.shape == (2, 3, 960)
+        assert torch.equal(padded[..., :928], x)
+        assert torch.count_nonzero(padded[..., 928:]) == 0
+
+    def test_nemotron_geometry_from_the_load_failure_is_accepted(self):
+        # shape '[128, 672, 2, 928]' is invalid for input of size 79822848 was the original error.
+        x = torch.empty(128, 672, 928, dtype=torch.int32)
+
+        assert _pad_w13_shard_cols(x, 928, 960).shape == (128, 672, 960)
+
+    def test_gated_weight_pads_each_shard_and_keeps_order(self):
+        unit = 4
+        gate = torch.full((2, 3, unit), 1.0)
+        up = torch.full((2, 3, unit), 2.0)
+
+        padded = _pad_w13_shard_cols(torch.cat([gate, up], dim=-1), unit, 8)
+
+        assert padded.shape == (2, 3, 16)
+        assert torch.equal(padded[..., :4], gate)
+        assert torch.equal(padded[..., 8:12], up)
+        assert torch.count_nonzero(padded[..., 4:8]) == 0
+        assert torch.count_nonzero(padded[..., 12:16]) == 0
+
+    def test_equal_sizes_return_the_tensor_untouched(self):
+        x = torch.zeros(2, 3, 7)
+        assert _pad_w13_shard_cols(x, 7, 7) is x
+        b = torch.zeros(2, 7)
+        assert _pad_w13_bias(b, 7, 7) is b
+
+    @pytest.mark.parametrize("columns", [3, 5, 12])
+    def test_weight_with_neither_one_nor_two_shards_is_rejected(self, columns):
+        with pytest.raises(ValueError, match="neither one nor two shards"):
+            _pad_w13_shard_cols(torch.zeros(1, 1, columns), 4, 8)
+
+    def test_bias_pads_one_and_two_shards(self):
+        one = torch.ones(2, 4)
+        padded = _pad_w13_bias(one, 4, 8)
+        assert padded.shape == (2, 8) and torch.count_nonzero(padded[:, 4:]) == 0
+
+        two = torch.cat([torch.full((2, 4), 1.0), torch.full((2, 4), 2.0)], dim=-1)
+        padded = _pad_w13_bias(two, 4, 8)
+        assert padded.shape == (2, 16)
+        assert torch.equal(padded[:, :4], two[:, :4])
+        assert torch.equal(padded[:, 8:12], two[:, 4:])
+        assert torch.count_nonzero(padded[:, 4:8]) == 0 and torch.count_nonzero(padded[:, 12:]) == 0
+
+    def test_install_replaces_both_helpers(self, monkeypatch):
+        fake = SimpleNamespace(_pad_w13_shard_cols=lambda *_: None, _pad_w13_bias=lambda *_: None)
+        monkeypatch.setitem(sys.modules, self.INT_WNA16, fake)
+
+        install_marlin_gateless_moe_padding()
+
+        assert fake._pad_w13_shard_cols is _pad_w13_shard_cols
+        assert fake._pad_w13_bias is _pad_w13_bias
+
+    def test_install_leaves_a_vllm_without_these_helpers_alone(self, monkeypatch):
+        fake = SimpleNamespace()
+        monkeypatch.setitem(sys.modules, self.INT_WNA16, fake)
+
+        install_marlin_gateless_moe_padding()
+
+        assert not hasattr(fake, "_pad_w13_shard_cols")
+
+    def test_install_survives_a_vllm_without_the_module(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, self.INT_WNA16, None)
+
+        install_marlin_gateless_moe_padding()
